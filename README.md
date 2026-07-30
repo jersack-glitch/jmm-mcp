@@ -74,16 +74,33 @@ HTTP request (or invoke the edge function directly), nightly, e.g. `0 8 * * *`
 - Headers: `Authorization: Bearer <anon-key>`, `Content-Type: application/json`
 - Body: `{"tool": "backfill_embeddings", "args": {}}`
 
-Manual drain (first run after applying the migration):
+Manual drain (first run after applying the migration) — one call starts a
+self-chain that works through the whole backlog in the background:
 
 ```bash
 curl -s -X POST "https://<project-ref>.supabase.co/functions/v1/jmm-mcp" \
   -H "Authorization: Bearer <anon-or-service-key>" \
   -H "Content-Type: application/json" \
-  -d '{"tool": "backfill_embeddings", "args": {"batch_size": 50}}'
+  -d '{"tool": "backfill_embeddings", "args": {}}'
 ```
 
-Repeat until the response reports `done: true`.
+Watch it converge in the SQL editor:
+
+```sql
+select
+  (select count(*) from memory where embedding is null and status = 'active') as memory_left,
+  (select count(*) from cross_insight where embedding is null) as insights_left,
+  (select count(*) from public.writing_embedding_backlog(1000)) as writing_left;
+```
+
+Why it works this way: edge workers have a tight per-invocation compute
+budget — on this project 5 rows/table per call died with
+`WORKER_RESOURCE_LIMIT`; 1/table fits. So each invocation embeds a tiny
+batch (rows persist as they embed) and, if the backlog isn't drained,
+fires the next invocation itself (fresh invocation = fresh budget), bounded
+by a hop cap and a made-progress check. The nightly cron gets full drains
+from a single trigger the same way. Pass `"chain": false` to disable
+self-chaining and loop from the shell instead.
 
 Everything degrades gracefully: before the migration is applied (or if
 `Supabase.ai` hiccups), writes fall back to the legacy shape and callers are
