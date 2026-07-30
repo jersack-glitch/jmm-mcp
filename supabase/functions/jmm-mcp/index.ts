@@ -402,35 +402,67 @@ async function backfillWritingBatch(batch: number): Promise<BackfillTableResult>
 
 // The nightly job: embeds everything the semantic layer covers — memory,
 // cross_insight, writing_piece (including stale writing rows). Schedule it
-// via Supabase Cron (see README); call until done: true for a manual drain.
+// via Supabase Cron (see README) — one trigger drains the whole backlog by
+// self-chaining (below).
 //
-// Batch sizes are deliberately small: edge workers have a per-invocation
+// Batch sizes are deliberately tiny: edge workers have a per-invocation
 // compute budget, and batch_size applies PER TABLE (3 tables per call).
-// 50/table blew the budget in production (WORKER_RESOURCE_LIMIT, 2026-07-30);
-// ~15 embeddings per invocation fits. Callers repeat until done — progress
-// persists row-by-row, so even a killed invocation keeps its completed rows.
+// Production findings on this project (2026-07-30): 50/table and 5/table both
+// died with WORKER_RESOURCE_LIMIT; 1/table fits. Progress persists row-by-row,
+// so even a killed invocation keeps its completed rows.
+//
+// Self-chaining: a fresh invocation gets a fresh compute budget, so when a
+// call finishes its batch and the backlog isn't drained, it fires the next
+// invocation itself (fire-and-forget, kept alive via EdgeRuntime.waitUntil).
+// Bounded by MAX_CHAIN_HOPS and a made-progress check so a permanently
+// failing row can't chain forever. Pass chain: false to disable (e.g. when
+// looping manually from a shell).
+const MAX_CHAIN_HOPS = 300
+
 async function backfillEmbeddings(args: Record<string, unknown>) {
-  const { batch_size } = args as { batch_size?: number }
-  const batch = Math.min(batch_size ?? 5, 10)
+  const { batch_size, chain, hops } = args as { batch_size?: number; chain?: boolean; hops?: number }
+  const batch = Math.min(batch_size ?? 1, 5)
+  const hop = hops ?? 0
 
   const memory = await backfillMemoryBatch(batch)
   const insights = await backfillInsightBatch(batch)
   const writing = await backfillWritingBatch(batch)
 
+  const done = memory.fetched < batch && insights.fetched < batch && writing.fetched < batch
+  const progressed = memory.embedded + insights.embedded + writing.embedded > 0
+  const chainNext = !done && chain !== false && progressed && hop < MAX_CHAIN_HOPS
+
+  if (chainNext) {
+    const next = fetch(`${supabaseUrl}/functions/v1/jmm-mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${supabaseServiceKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        tool: "backfill_embeddings",
+        args: { batch_size: batch, chain: true, hops: hop + 1 },
+      }),
+    }).then((r) => r.body?.cancel()).catch(() => {})
+    const runtime = (globalThis as unknown as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime
+    if (runtime?.waitUntil) runtime.waitUntil(next)
+    else await next
+  }
+
   return {
     memory,
     cross_insight: insights,
     writing_piece: writing,
-    done: memory.fetched < batch && insights.fetched < batch && writing.fetched < batch,
+    done,
+    ...(chainNext ? { chained: true, hop } : {}),
   }
 }
 
 // Memory-only backfill, kept for compatibility; prefer backfill_embeddings.
-// Single table, so the per-invocation compute budget allows a larger batch
-// than backfill_embeddings — but the same ceiling logic applies.
+// No self-chaining here — loop until done: true. Same compute-budget ceiling.
 async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
   const { batch_size } = args as { batch_size?: number }
-  const batch = Math.min(batch_size ?? 10, 25)
+  const batch = Math.min(batch_size ?? 2, 5)
 
   const result = await backfillMemoryBatch(batch)
 
