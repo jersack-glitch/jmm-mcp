@@ -1,10 +1,12 @@
 // JMM MCP — Custom logic for the Jeremy Management Model
 // Generic CRUD is handled by the native Supabase MCP.
 // This function enforces JMM-specific rules: memory approval, triage queries,
-// and the memory semantic layer — embeddings (Supabase.ai gte-small, 384 dims),
-// hybrid vector + keyword recall, near-duplicate detection, and embedding backfill.
+// and the semantic layer — embeddings (Supabase.ai gte-small, 384 dims) over
+// memory, cross_insight, and writing_piece, hybrid memory recall,
+// near-duplicate detection, and the nightly backfill_embeddings job.
 // It is also the embedding service the Node JMM servers (jmm-mcp-server) call
-// via the embed_text tool.
+// via the embed_text tool. Operational tables (thread, project, BMM) are
+// deliberately outside the semantic layer.
 
 import "@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "jsr:@supabase/supabase-js@2"
@@ -37,6 +39,9 @@ Deno.serve(async (req) => {
         break
       case "embed_text":
         result = await embedText(args)
+        break
+      case "backfill_embeddings":
+        result = await backfillEmbeddings(args)
         break
       case "backfill_memory_embeddings":
         result = await backfillMemoryEmbeddings(args)
@@ -307,10 +312,53 @@ async function recallMemory(args: Record<string, unknown>) {
   }
 }
 
-async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
-  const { batch_size } = args as { batch_size?: number }
-  const batch = Math.min(batch_size ?? 50, 200)
+// ---------- Embedding backfill (the nightly job) ----------
 
+// Text derivations MUST stay in sync with the Node servers (lib/semantic.js):
+// insight rows embed `title \n\n body`; writing rows embed title + notes +
+// draft_snapshot; memory rows embed content alone.
+function joinEmbeddableText(parts: Array<string | null | undefined>): string {
+  return parts.filter((p) => p && p.trim()).join("\n\n")
+}
+
+interface BackfillTableResult {
+  fetched: number
+  embedded: number
+  failed: number
+  failures?: Array<{ id: string; error: string }>
+}
+
+async function embedRows(
+  table: string,
+  rows: Array<Record<string, unknown>>,
+  textOf: (row: Record<string, unknown>) => string,
+  extraUpdate: Record<string, unknown> = {},
+): Promise<BackfillTableResult> {
+  let embedded = 0
+  const failures: Array<{ id: string; error: string }> = []
+  for (const row of rows) {
+    try {
+      const text = textOf(row)
+      const [vec] = await embedTexts([text || " "])
+      const upd = await supabase
+        .from(table)
+        .update({ embedding: vec, embedding_model: EMBEDDING_MODEL, ...extraUpdate })
+        .eq("id", row.id)
+      if (upd.error) throw new Error(upd.error.message)
+      embedded++
+    } catch (err) {
+      failures.push({ id: String(row.id), error: err instanceof Error ? err.message : String(err) })
+    }
+  }
+  return {
+    fetched: rows.length,
+    embedded,
+    failed: failures.length,
+    ...(failures.length ? { failures: failures.slice(0, 5) } : {}),
+  }
+}
+
+async function backfillMemoryBatch(batch: number): Promise<BackfillTableResult> {
   const { data, error } = await supabase
     .from("memory")
     .select("id, content")
@@ -319,24 +367,64 @@ async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
     .order("created_at", { ascending: true })
     .limit(batch)
   if (error) {
-    throw new Error(`backfill query failed (is the memory_semantic_search migration applied?): ${error.message}`)
+    throw new Error(`memory backfill query failed (is the memory_semantic_search migration applied?): ${error.message}`)
   }
+  return embedRows("memory", data ?? [], (r) => String(r.content ?? ""))
+}
 
-  let embedded = 0
-  const failures: Array<{ id: string; error: string }> = []
-  for (const row of data ?? []) {
-    try {
-      const [vec] = await embedTexts([row.content ?? ""])
-      const upd = await supabase
-        .from("memory")
-        .update({ embedding: vec, embedding_model: EMBEDDING_MODEL })
-        .eq("id", row.id)
-      if (upd.error) throw new Error(upd.error.message)
-      embedded++
-    } catch (err) {
-      failures.push({ id: row.id, error: err instanceof Error ? err.message : String(err) })
-    }
+async function backfillInsightBatch(batch: number): Promise<BackfillTableResult> {
+  const { data, error } = await supabase
+    .from("cross_insight")
+    .select("id, title, body")
+    .is("embedding", null)
+    .order("last_seen_week", { ascending: true })
+    .limit(batch)
+  if (error) {
+    throw new Error(`cross_insight backfill query failed (is the migration applied?): ${error.message}`)
   }
+  return embedRows("cross_insight", data ?? [], (r) => joinEmbeddableText([r.title as string, r.body as string]))
+}
+
+async function backfillWritingBatch(batch: number): Promise<BackfillTableResult> {
+  // writing_embedding_backlog also returns rows edited after their last
+  // embedding (updated_at > embedded_at), which PostgREST filters can't express.
+  const { data, error } = await supabase.rpc("writing_embedding_backlog", { p_limit: batch })
+  if (error) {
+    throw new Error(`writing backfill query failed (is the migration applied?): ${error.message}`)
+  }
+  return embedRows(
+    "writing_piece",
+    (data ?? []) as Array<Record<string, unknown>>,
+    (r) => joinEmbeddableText([r.title as string, r.notes as string, r.draft_snapshot as string]),
+    { embedded_at: new Date().toISOString() },
+  )
+}
+
+// The nightly job: embeds everything the semantic layer covers — memory,
+// cross_insight, writing_piece (including stale writing rows). Schedule it
+// via Supabase Cron (see README); call until done: true for a manual drain.
+async function backfillEmbeddings(args: Record<string, unknown>) {
+  const { batch_size } = args as { batch_size?: number }
+  const batch = Math.min(batch_size ?? 50, 200)
+
+  const memory = await backfillMemoryBatch(batch)
+  const insights = await backfillInsightBatch(batch)
+  const writing = await backfillWritingBatch(batch)
+
+  return {
+    memory,
+    cross_insight: insights,
+    writing_piece: writing,
+    done: memory.fetched < batch && insights.fetched < batch && writing.fetched < batch,
+  }
+}
+
+// Memory-only backfill, kept for compatibility; prefer backfill_embeddings.
+async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
+  const { batch_size } = args as { batch_size?: number }
+  const batch = Math.min(batch_size ?? 50, 200)
+
+  const result = await backfillMemoryBatch(batch)
 
   const { count } = await supabase
     .from("memory")
@@ -345,9 +433,7 @@ async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
     .eq("status", "active")
 
   return {
-    embedded,
-    failed: failures.length,
-    ...(failures.length ? { failures: failures.slice(0, 5) } : {}),
+    ...result,
     remaining: count ?? null,
     done: (count ?? 0) === 0,
   }
