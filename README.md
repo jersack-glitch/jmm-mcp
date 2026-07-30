@@ -77,13 +77,22 @@ HTTP request (or invoke the edge function directly), nightly, e.g. `0 8 * * *`
 Manual drain (first run after applying the migration):
 
 ```bash
-curl -s -X POST "https://<project-ref>.supabase.co/functions/v1/jmm-mcp" \
-  -H "Authorization: Bearer <anon-or-service-key>" \
-  -H "Content-Type: application/json" \
-  -d '{"tool": "backfill_embeddings", "args": {"batch_size": 50}}'
+while :; do
+  out=$(curl -s -X POST "https://<project-ref>.supabase.co/functions/v1/jmm-mcp" \
+    -H "Authorization: Bearer <anon-or-service-key>" \
+    -H "Content-Type: application/json" \
+    -d '{"tool": "backfill_embeddings", "args": {}}')
+  echo "$out"
+  echo "$out" | grep -q '"done": true' && break
+  sleep 2
+done
 ```
 
-Repeat until the response reports `done: true`.
+Batches are small on purpose: edge workers have a per-invocation compute
+budget, and `batch_size` applies per table (capped at 10; 50 hit
+`WORKER_RESOURCE_LIMIT` in production). Rows persist as they embed, so a
+killed invocation loses nothing — the loop just keeps going until
+`done: true`.
 
 Everything degrades gracefully: before the migration is applied (or if
 `Supabase.ai` hiccups), writes fall back to the legacy shape and callers are

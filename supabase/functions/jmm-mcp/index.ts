@@ -403,9 +403,15 @@ async function backfillWritingBatch(batch: number): Promise<BackfillTableResult>
 // The nightly job: embeds everything the semantic layer covers — memory,
 // cross_insight, writing_piece (including stale writing rows). Schedule it
 // via Supabase Cron (see README); call until done: true for a manual drain.
+//
+// Batch sizes are deliberately small: edge workers have a per-invocation
+// compute budget, and batch_size applies PER TABLE (3 tables per call).
+// 50/table blew the budget in production (WORKER_RESOURCE_LIMIT, 2026-07-30);
+// ~15 embeddings per invocation fits. Callers repeat until done — progress
+// persists row-by-row, so even a killed invocation keeps its completed rows.
 async function backfillEmbeddings(args: Record<string, unknown>) {
   const { batch_size } = args as { batch_size?: number }
-  const batch = Math.min(batch_size ?? 50, 200)
+  const batch = Math.min(batch_size ?? 5, 10)
 
   const memory = await backfillMemoryBatch(batch)
   const insights = await backfillInsightBatch(batch)
@@ -420,9 +426,11 @@ async function backfillEmbeddings(args: Record<string, unknown>) {
 }
 
 // Memory-only backfill, kept for compatibility; prefer backfill_embeddings.
+// Single table, so the per-invocation compute budget allows a larger batch
+// than backfill_embeddings — but the same ceiling logic applies.
 async function backfillMemoryEmbeddings(args: Record<string, unknown>) {
   const { batch_size } = args as { batch_size?: number }
-  const batch = Math.min(batch_size ?? 50, 200)
+  const batch = Math.min(batch_size ?? 10, 25)
 
   const result = await backfillMemoryBatch(batch)
 
